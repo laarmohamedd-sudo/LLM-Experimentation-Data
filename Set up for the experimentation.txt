@@ -1,0 +1,1164 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+
+type ExperimentId = "pd" | "pgg" | "mix" | "entry" | "iia";
+
+type Experiment = {
+  id: ExperimentId;
+  label: string;
+  conditions: string[];
+};
+
+type RawRow = {
+  runId: string;
+  experimentId: ExperimentId;
+  experimentLabel: string;
+  condition: string;
+  iteration: number;
+  persona: string;
+  temperature: number;
+  lambda: number;
+  belief: number | null;
+  choice: string | null;
+  note: string;
+  rawText: string;
+  extra: Record<string, unknown>;
+};
+
+type SummaryRow = {
+  experimentId: ExperimentId;
+  experimentLabel: string;
+  condition: string;
+  n: number;
+  metrics: Record<string, unknown>;
+};
+
+type Snapshot = {
+  reps: number;
+  kappa: number;
+  lambda0: number;
+  rawRows: RawRow[];
+  log: string[];
+  status: string;
+  savedAt: string;
+};
+
+const STORAGE_KEYS = [
+  "art-rationality-v7-remaining",
+  "art-rationality-v7-pd-only",
+] as const;
+
+const STORAGE_KEY = STORAGE_KEYS[0];
+
+const EXPERIMENTS: Experiment[] = [
+  { id: "pd", label: "E. Repeated PD", conditions: ["vsTFT,T=10", "vsTFT,T=20", "vsAlwaysC,T=10", "vsAlwaysD,T=10", "vsGrim,T=10", "vsTFT,ambig"] },
+  { id: "pgg", label: "F. Public Goods", conditions: ["N=3,m=1.5", "N=5,m=2", "N=5,m=3", "N=10,m=2", "N=5,oth=$0", "N=5,oth=$5", "N=5,oth=$10"] },
+  { id: "mix", label: "G. Mixed 2x2", conditions: ["Row-Abstract", "Row-Business", "Row-Competition", "Column-Abstract", "Column-Business", "Column-Competition"] },
+  { id: "entry", label: "H. Entry Deterrence", conditions: ["Neutral", "Business", "Competition", "Algorithmic"] },
+  { id: "iia", label: "I. IIA / Decoy Sensitivity", conditions: ["Prod:Bin", "Prod:DecA", "Prod:DecB", "Job:Bin", "Job:DecA", "Job:DecB", "Inv:Bin", "Inv:DecA", "Inv:DecB"] },
+];
+
+const PERSONAS = [
+  "analytical",
+  "careful",
+  "competitive",
+  "fairness-sensitive",
+  "strategic",
+  "literal",
+  "patient",
+  "decisive",
+  "risk-aware",
+  "rule-following",
+];
+
+const FLAVORS = [
+  "Fresh draw. Answer independently.",
+  "Treat this as a new observation.",
+  "Do not mirror earlier outputs.",
+  "Return the most direct answer.",
+  "Be concise and literal.",
+  "No explanation, only JSON.",
+];
+
+function personaFor(i: number) {
+  return PERSONAS[i % PERSONAS.length];
+}
+
+function flavorFor(i: number) {
+  return FLAVORS[i % FLAVORS.length];
+}
+
+function tempFor(i: number) {
+  const base = 0.9 + Math.random() * 0.1;
+  const jitter = (i % 7) * 0.001;
+  return Math.min(1, +(base + jitter).toFixed(3));
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function cleanJson(text: string) {
+  return text.replace(/```json/gi, "").replace(/```/g, "").trim();
+}
+
+function parseJSON<T>(text: string): T | null {
+  try {
+    const cleaned = cleanJson(text);
+    const start = cleaned.indexOf("{");
+    const end = cleaned.lastIndexOf("}");
+    const slice = start >= 0 && end > start ? cleaned.slice(start, end + 1) : cleaned;
+    return JSON.parse(slice) as T;
+  } catch {
+    return null;
+  }
+}
+
+function mean(xs: number[]) {
+  const arr = xs.filter((x) => Number.isFinite(x));
+  if (!arr.length) return NaN;
+  return arr.reduce((a, b) => a + b, 0) / arr.length;
+}
+
+function pct(num: number, den: number) {
+  if (!den) return 0;
+  return +(100 * num / den).toFixed(1);
+}
+
+function qreProbability(ua: number, ub: number, lambda: number) {
+  return 1 / (1 + Math.exp(-lambda * (ua - ub)));
+}
+
+function loadSnapshot(): Snapshot | null {
+  try {
+    for (const key of STORAGE_KEYS) {
+      const raw = localStorage.getItem(key);
+      if (raw) return JSON.parse(raw) as Snapshot;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function saveSnapshot(payload: Snapshot) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+  } catch {
+    // ignore
+  }
+}
+
+function normalizeRows(rows: RawRow[]) {
+  const map = new Map<string, RawRow>();
+  for (const row of rows) {
+    const key = `${row.experimentId}::${row.condition}::${row.iteration}`;
+    map.set(key, row);
+  }
+  return Array.from(map.values()).sort((a, b) => {
+    if (a.experimentId !== b.experimentId) return a.experimentId.localeCompare(b.experimentId);
+    if (a.condition !== b.condition) return a.condition.localeCompare(b.condition);
+    return a.iteration - b.iteration;
+  });
+}
+
+function bestResponsePDAction() {
+  return "D";
+}
+
+function bestResponseBertrand(mc: number, beliefPrice: number) {
+  const grid = Array.from({ length: 21 }, (_, i) => mc + i);
+  let bestP = grid[0];
+  let bestProfit = -Infinity;
+
+  for (const p of grid) {
+    let profit = 0;
+    if (p < mc) profit = -Infinity;
+    else if (p < beliefPrice) profit = p - mc;
+    else if (p === beliefPrice) profit = 0.5 * (p - mc);
+    else profit = 0;
+
+    if (profit > bestProfit || (profit === bestProfit && p < bestP)) {
+      bestProfit = profit;
+      bestP = p;
+    }
+  }
+
+  return bestP;
+}
+
+function bestResponseAuction(v: number, beliefHighBid: number) {
+  const grid = Array.from({ length: v + 1 }, (_, i) => i);
+  let bestB = grid[0];
+  let bestU = -Infinity;
+
+  for (const b of grid) {
+    let u = 0;
+    if (b > v) u = -Infinity;
+    else if (b > beliefHighBid) u = v - b;
+    else if (b === beliefHighBid) u = 0.5 * (v - b);
+    else u = 0;
+
+    if (u > bestU || (u === bestU && b < bestB)) {
+      bestU = u;
+      bestB = b;
+    }
+  }
+
+  return bestB;
+}
+
+function brMix(role: "row" | "col", belief: number) {
+  if (role === "row") return belief > 1 / 3 ? "U" : "D";
+  return belief > 2 / 3 ? "L" : "R";
+}
+
+async function callLLM(
+  prompt: string,
+  temperature: number,
+  shouldStop?: () => boolean
+) {
+  while (true) {
+    if (shouldStop?.()) throw new Error("Stopped");
+
+    try {
+      const res = await fetch("http://localhost:3001/api/experiments/call", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt, temperature }),
+      });
+
+      if (res.ok) {
+        const data = (await res.json()) as { text?: string };
+        return String(data.text ?? "");
+      }
+
+      if (res.status === 429) {
+        const retryAfter = res.headers.get("retry-after");
+        const waitMs = retryAfter ? Math.max(5000, Number(retryAfter) * 1000) : 5000;
+        await sleep(waitMs);
+        continue;
+      }
+
+      if (res.status >= 500) {
+        await sleep(5000);
+        continue;
+      }
+
+      throw new Error(`API ${res.status}: ${await res.text()}`);
+    } catch (err) {
+      if (shouldStop?.()) throw new Error("Stopped");
+      await sleep(5000);
+    }
+  }
+}
+
+export default function App() {
+  const initialSnapshot = useMemo(() => loadSnapshot(), []);
+  const initialRows = useMemo(() => normalizeRows(initialSnapshot?.rawRows ?? []), [initialSnapshot]);
+  const initialReps = initialSnapshot?.reps ?? 60;
+  const initialTotal = EXPERIMENTS.reduce((sum, exp) => sum + exp.conditions.length * initialReps, 0);
+
+  const [reps, setReps] = useState(initialReps);
+  const [kappa, setKappa] = useState(initialSnapshot?.kappa ?? 1.5);
+  const [lambda0, setLambda0] = useState(initialSnapshot?.lambda0 ?? 2.0);
+  const lambda = useMemo(() => kappa * lambda0, [kappa, lambda0]);
+
+  const [running, setRunning] = useState(false);
+  const [paused, setPaused] = useState(false);
+  const [status, setStatus] = useState(initialSnapshot?.status ?? "Ready.");
+  const [currentExp, setCurrentExp] = useState<ExperimentId | "">("");
+  const [currentCond, setCurrentCond] = useState("");
+  const [currentIter, setCurrentIter] = useState(0);
+  const [progress, setProgress] = useState({
+    done: initialRows.length,
+    total: initialTotal,
+  });
+
+  const [rawRows, setRawRows] = useState<RawRow[]>(initialRows);
+  const [log, setLog] = useState<string[]>(initialSnapshot?.log ?? []);
+
+  const stopRef = useRef(false);
+  const pauseRef = useRef(false);
+  const hydratedRef = useRef(false);
+  const rawRowsRef = useRef<RawRow[]>(initialRows);
+
+  useEffect(() => {
+    hydratedRef.current = true;
+  }, []);
+
+  useEffect(() => {
+    rawRowsRef.current = rawRows;
+  }, [rawRows]);
+
+  useEffect(() => {
+    if (!hydratedRef.current) return;
+    const snap: Snapshot = {
+      reps,
+      kappa,
+      lambda0,
+      rawRows,
+      log,
+      status,
+      savedAt: new Date().toISOString(),
+    };
+    saveSnapshot(snap);
+  }, [reps, kappa, lambda0, rawRows, log, status]);
+
+  const totalTarget = useMemo(
+    () => EXPERIMENTS.reduce((sum, exp) => sum + exp.conditions.length * reps, 0),
+    [reps]
+  );
+
+  const addLog = (m: string) => {
+    setLog((prev) => [...prev.slice(-300), `[${new Date().toLocaleTimeString()}] ${m}`]);
+  };
+
+  const setRunningState = (on: boolean) => {
+    setRunning(on);
+    if (!on) {
+      setPaused(false);
+      pauseRef.current = false;
+    }
+  };
+
+  const waitIfPaused = async () => {
+    while (pauseRef.current && !stopRef.current) {
+      await sleep(200);
+    }
+  };
+
+  const rateLimitDelay = async () => {
+    await sleep(3000);
+  };
+
+  function rowsForCond(expId: ExperimentId, cond: string) {
+    return rawRowsRef.current.filter((r) => r.experimentId === expId && r.condition === cond);
+  }
+
+  function startIterationFor(expId: ExperimentId, cond: string) {
+    const rows = rowsForCond(expId, cond);
+    if (!rows.length) return 1;
+    return Math.max(...rows.map((r) => r.iteration)) + 1;
+  }
+
+  function completedFor(expId: ExperimentId, cond: string) {
+    return rowsForCond(expId, cond).length;
+  }
+
+  function appendRawRow(row: RawRow) {
+    setRawRows((prev) => {
+      const key = `${row.experimentId}::${row.condition}::${row.iteration}`;
+      const filtered = prev.filter((r) => `${r.experimentId}::${r.condition}::${r.iteration}` !== key);
+      const next = [...filtered, row];
+      rawRowsRef.current = next;
+      return next;
+    });
+    setProgress((p) => ({ ...p, done: p.done + 1 }));
+  }
+
+  function buildSummaryRows(rows: RawRow[], repsForSummary: number): SummaryRow[] {
+    const out: SummaryRow[] = [];
+
+    for (const exp of EXPERIMENTS) {
+      for (const cond of exp.conditions) {
+        const condRows = rows.filter((r) => r.experimentId === exp.id && r.condition === cond);
+        if (!condRows.length) continue;
+
+        if (exp.id === "pd") {
+          const coop = condRows.filter((r) => r.choice === "C").length;
+          const early = condRows.filter((r) => r.iteration <= 2 && r.choice === "C").length;
+          const late = condRows.filter((r) => r.iteration > repsForSummary - 2 && r.choice === "C").length;
+          const beliefRows = condRows.filter((r) => typeof r.belief === "number");
+          const belAcc = beliefRows.length
+            ? beliefRows.filter((r) => r.extra.beliefCorrect === true).length
+            : 0;
+
+          out.push({
+            experimentId: "pd",
+            experimentLabel: "E. Repeated PD",
+            condition: cond,
+            n: condRows.length,
+            metrics: {
+              coopRate: pct(coop, condRows.length),
+              earlyCoopRate: pct(early, Math.min(2, condRows.length)),
+              lateCoopRate: pct(late, Math.min(2, condRows.length)),
+              beliefAcc: beliefRows.length ? pct(belAcc, beliefRows.length) : 0,
+              note: "finite-horizon rounds",
+            },
+          });
+        }
+
+        if (exp.id === "pgg") {
+          const contribs = condRows.map((r) => Number(r.extra.contribution)).filter((x) => Number.isFinite(x));
+          const freeRate = pct(condRows.filter((r) => r.extra.free === true).length, condRows.length);
+
+          out.push({
+            experimentId: "pgg",
+            experimentLabel: "F. Public Goods",
+            condition: cond,
+            n: condRows.length,
+            metrics: {
+              meanContributionPct: +mean(contribs).toFixed(1),
+              freeRate,
+              meanBelief: +mean(condRows.map((r) => Number(r.belief))).toFixed(2),
+            },
+          });
+        }
+
+        if (exp.id === "mix") {
+          const beliefs = condRows.map((r) => Number(r.belief)).filter((x) => Number.isFinite(x));
+          const brRate = pct(condRows.filter((r) => r.extra.brMatch === true).length, condRows.length);
+          const targetRate = pct(condRows.filter((r) => ["U", "L"].includes(String(r.choice))).length, condRows.length);
+
+          out.push({
+            experimentId: "mix",
+            experimentLabel: "G. Mixed 2x2",
+            condition: cond,
+            n: condRows.length,
+            metrics: {
+              meanBelief: +mean(beliefs).toFixed(2),
+              brRate,
+              targetOrLeftRate: targetRate,
+            },
+          });
+        }
+
+        if (exp.id === "entry") {
+          const lowCommit = pct(condRows.filter((r) => r.choice === "Low").length, condRows.length);
+          const entryRate = pct(condRows.filter((r) => r.extra.entrant === "Enter").length, condRows.length);
+          const brCommitRate = pct(condRows.filter((r) => r.extra.brMatchCommit === true).length, condRows.length);
+
+          out.push({
+            experimentId: "entry",
+            experimentLabel: "H. Entry Deterrence",
+            condition: cond,
+            n: condRows.length,
+            metrics: {
+              pHigh: +mean(condRows.map((r) => Number(r.extra.pHigh))).toFixed(2),
+              pLow: +mean(condRows.map((r) => Number(r.extra.pLow))).toFixed(2),
+              lowCommitRate: lowCommit,
+              entryRate,
+              brCommitRate,
+            },
+          });
+        }
+
+        if (exp.id === "iia") {
+          const counts: Record<string, number> = {};
+          for (const r of condRows) {
+            const c = String(r.choice ?? "NA");
+            counts[c] = (counts[c] ?? 0) + 1;
+          }
+
+          out.push({
+            experimentId: "iia",
+            experimentLabel: "I. IIA / Decoy Sensitivity",
+            condition: cond,
+            n: condRows.length,
+            metrics: {
+              A: pct(counts.A ?? 0, condRows.length),
+              B: pct(counts.B ?? 0, condRows.length),
+              C: pct(counts.C ?? 0, condRows.length),
+            },
+          });
+        }
+      }
+    }
+
+    return out;
+  }
+
+  const summaryRows = useMemo(() => buildSummaryRows(rawRows, reps), [rawRows, reps]);
+
+  async function runObservation(
+    expId: Exclude<ExperimentId, "pd">,
+    cond: string,
+    iter: number,
+    persona: string,
+    temperature: number
+  ): Promise<RawRow> {
+    const flavor = flavorFor(iter);
+
+    if (expId === "pgg") {
+      const N = Number(cond.match(/N=([0-9]+)/)?.[1] ?? 5);
+      const m = Number(cond.match(/m=([0-9.]+)/)?.[1] ?? 2);
+      const othersHint = cond.includes("oth=$0")
+        ? 0
+        : cond.includes("oth=$5")
+        ? 5
+        : cond.includes("oth=$10")
+        ? 10
+        : null;
+
+      const prompt = `
+Persona: ${persona}.
+${flavor}
+Public goods game.
+${N} players, each has $10.
+Multiplier = ${m}.
+${othersHint === null ? "You do not know others' contributions." : `Others contributed an average of $${othersHint} in the last round.`}
+
+Return strict JSON only:
+{"beliefOthersContrib": 0.0, "contribution": 0.0}
+`.trim();
+
+      const rawText = await callLLM(prompt, temperature, () => stopRef.current);
+      const parsed = parseJSON<any>(rawText) ?? {};
+      const beliefOthers = typeof parsed.beliefOthersContrib === "number" ? parsed.beliefOthersContrib : 5;
+      const contribution = typeof parsed.contribution === "number" ? Math.max(0, Math.min(10, parsed.contribution)) : 0;
+
+      return {
+        runId: `${expId}-${cond}-${iter}`,
+        experimentId: "pgg",
+        experimentLabel: "F. Public Goods",
+        condition: cond,
+        iteration: iter,
+        persona,
+        temperature,
+        lambda,
+        belief: beliefOthers,
+        choice: String(contribution),
+        note: `contrib=${contribution.toFixed(0)}`,
+        rawText,
+        extra: {
+          N,
+          m,
+          othersHint,
+          contribution,
+          pctContribution: +(100 * contribution / 10).toFixed(1),
+          free: contribution === 0,
+        },
+      };
+    }
+
+    if (expId === "mix") {
+      const role = cond.startsWith("Row") ? "row" : "col";
+      const frame = cond.split("-")[1] ?? "abstract";
+
+      const prompt = role === "row"
+        ? `
+Persona: ${persona}.
+${flavor}
+Mixed 2x2 game (${frame} framing).
+You are the Row player.
+
+Payoffs:
+(U,L)=2
+(U,R)=0
+(D,L)=0
+(D,R)=1
+
+Return strict JSON only:
+{"beliefOppPlayL": 0.0, "choice": "U"}
+`.trim()
+        : `
+Persona: ${persona}.
+${flavor}
+Mixed 2x2 game (${frame} framing).
+You are the Column player.
+
+Payoffs:
+(U,L)=1
+(U,R)=0
+(D,L)=0
+(D,R)=2
+
+Return strict JSON only:
+{"beliefOppPlayU": 0.0, "choice": "L"}
+`.trim();
+
+      const rawText = await callLLM(prompt, temperature, () => stopRef.current);
+      const parsed = parseJSON<any>(rawText) ?? {};
+
+      const belief = role === "row"
+        ? (typeof parsed.beliefOppPlayL === "number" ? parsed.beliefOppPlayL : 0.5)
+        : (typeof parsed.beliefOppPlayU === "number" ? parsed.beliefOppPlayU : 0.5);
+
+      const choice = typeof parsed.choice === "string" ? parsed.choice.toUpperCase() : null;
+      const br = brMix(role, belief);
+      const pA = role === "row"
+        ? qreProbability(2 * belief, 1 * (1 - belief), lambda)
+        : qreProbability(1 * belief, 2 * (1 - belief), lambda);
+
+      return {
+        runId: `${expId}-${cond}-${iter}`,
+        experimentId: "mix",
+        experimentLabel: "G. Mixed 2x2",
+        condition: cond,
+        iteration: iter,
+        persona,
+        temperature,
+        lambda,
+        belief,
+        choice,
+        note: choice ? `choice=${choice}` : "mix",
+        rawText,
+        extra: {
+          role,
+          frame,
+          pA,
+          br,
+          brMatch: choice != null ? choice === br : null,
+        },
+      };
+    }
+
+    if (expId === "entry") {
+      const frame = cond.toLowerCase();
+
+      const prompt = `
+Persona: ${persona}.
+${flavor}
+Entry-deterrence game (${frame} framing).
+
+Incumbent chooses High or Low.
+Entrant chooses Enter or Stay out.
+
+Payoffs:
+If incumbent chose High:
+- Enter => entrant 3
+- Stay out => entrant 0
+If incumbent chose Low:
+- Enter => entrant -1
+- Stay out => entrant 0
+
+Return strict JSON only:
+{"pHigh": 0.0, "pLow": 0.0, "commitment": "High", "entrant": "Enter"}
+`.trim();
+
+      const rawText = await callLLM(prompt, temperature, () => stopRef.current);
+      const parsed = parseJSON<any>(rawText) ?? {};
+      const pHigh = typeof parsed.pHigh === "number" ? parsed.pHigh : 0.85;
+      const pLow = typeof parsed.pLow === "number" ? parsed.pLow : 0.2;
+      const commitment = typeof parsed.commitment === "string" && parsed.commitment.toLowerCase().includes("low") ? "Low" : "High";
+      const entrant = typeof parsed.entrant === "string" && parsed.entrant.toLowerCase().includes("enter") ? "Enter" : "Stay out";
+      const brCommit = 4 - 2 * pHigh >= 3 - 2 * pLow ? "High" : "Low";
+      const brEntrant = commitment === "High" ? "Enter" : "Stay out";
+
+      return {
+        runId: `${expId}-${cond}-${iter}`,
+        experimentId: "entry",
+        experimentLabel: "H. Entry Deterrence",
+        condition: cond,
+        iteration: iter,
+        persona,
+        temperature,
+        lambda,
+        belief: pHigh,
+        choice: commitment,
+        note: `commit=${commitment}`,
+        rawText,
+        extra: {
+          pHigh,
+          pLow,
+          brCommit,
+          brEntrant,
+          brMatchCommit: commitment === brCommit,
+          brMatchEntrant: entrant === brEntrant,
+          entrant,
+        },
+      };
+    }
+
+    if (expId === "iia") {
+      const domain = cond.split(":")[0].toLowerCase();
+      const decoy = cond.includes("Dec");
+      const tgt = cond.includes("DecA") ? "A" : cond.includes("DecB") ? "B" : null;
+
+      const prompt = domain === "prod"
+        ? `
+Persona: ${persona}.
+${flavor}
+Choose one product.
+
+A: Quality 7/10, Price 50
+${decoy ? (tgt === "A"
+            ? "B: Quality 5/10, Price 30\nC: Quality 6/10, Price 55"
+            : "B: Quality 5/10, Price 30\nC: Quality 4/10, Price 35")
+          : "B: Quality 5/10, Price 30"}
+
+Return strict JSON only:
+{"choice": "A"}
+`.trim()
+        : domain === "job"
+        ? `
+Persona: ${persona}.
+${flavor}
+Choose one candidate.
+
+A: Experience 7/10, Salary 90
+${decoy ? (tgt === "A"
+            ? "B: Experience 5/10, Salary 60\nC: Experience 6/10, Salary 95"
+            : "B: Experience 5/10, Salary 60\nC: Experience 4/10, Salary 65")
+          : "B: Experience 5/10, Salary 60"}
+
+Return strict JSON only:
+{"choice": "A"}
+`.trim()
+        : `
+Persona: ${persona}.
+${flavor}
+Choose one investment.
+
+A: Return 7%, Risk 5/10
+${decoy ? (tgt === "A"
+            ? "B: Return 4%, Risk 2/10\nC: Return 6%, Risk 6/10"
+            : "B: Return 4%, Risk 2/10\nC: Return 3%, Risk 3/10")
+          : "B: Return 4%, Risk 2/10"}
+
+Return strict JSON only:
+{"choice": "A"}
+`.trim();
+
+      const rawText = await callLLM(prompt, temperature, () => stopRef.current);
+      const parsed = parseJSON<any>(rawText) ?? {};
+      const choice = typeof parsed.choice === "string" ? parsed.choice.toUpperCase() : null;
+
+      return {
+        runId: `${expId}-${cond}-${iter}`,
+        experimentId: "iia",
+        experimentLabel: "I. IIA / Decoy Sensitivity",
+        condition: cond,
+        iteration: iter,
+        persona,
+        temperature,
+        lambda,
+        belief: null,
+        choice,
+        note: choice ? `choice=${choice}` : "iia",
+        rawText,
+        extra: {
+          domain,
+          decoy,
+          tgt,
+        },
+      };
+    }
+
+    throw new Error(`Unknown experiment: ${expId}`);
+  }
+
+  async function runPDObservation(cond: string, iter: number, persona: string, temperature: number): Promise<RawRow> {
+    const flavor = flavorFor(iter);
+    const priorRows = rowsForCond("pd", cond);
+
+    const strat = cond.includes("TFT")
+      ? "tit_for_tat"
+      : cond.includes("AlwaysC")
+      ? "always_cooperate"
+      : cond.includes("AlwaysD")
+      ? "always_defect"
+      : "grim";
+
+    const history = priorRows.slice(-8).length
+      ? priorRows.slice(-8).map((r) => `R${r.iteration}: you=${r.choice} opp=${String(r.extra.opp ?? "C")}`).join(" | ")
+      : "No prior rounds.";
+
+    const prompt = `
+Persona: ${persona}.
+${flavor}
+Prisoner's Dilemma. Condition: ${cond}
+Round ${iter} of ${reps}.
+History: ${history}
+
+Payoffs:
+CC=3 each
+CD=0/5
+DC=5/0
+DD=1 each
+
+Return strict JSON only:
+{"beliefOppWillC": 0.0, "action": "C"}
+`.trim();
+
+    await rateLimitDelay();
+    const rawText = await callLLM(prompt, temperature, () => stopRef.current);
+    const parsed = parseJSON<any>(rawText) ?? {};
+    const belief = typeof parsed.beliefOppWillC === "number" ? parsed.beliefOppWillC : 0.5;
+    const action = typeof parsed.action === "string" ? parsed.action.toUpperCase() === "D" ? "D" : "C" : "C";
+
+    const opp = strat === "always_cooperate"
+      ? "C"
+      : strat === "always_defect"
+      ? "D"
+      : strat === "grim"
+      ? (priorRows.some((r) => r.choice === "D") || action === "D" ? "D" : "C")
+      : priorRows.length === 0
+      ? "C"
+      : (priorRows[priorRows.length - 1].choice ?? "C");
+
+    const payoff =
+      action === "C" && opp === "C" ? 3 :
+      action === "D" && opp === "C" ? 5 :
+      action === "C" && opp === "D" ? 0 : 1;
+
+    return {
+      runId: `pd-${cond}-${iter}`,
+      experimentId: "pd",
+      experimentLabel: "E. Repeated PD",
+      condition: cond,
+      iteration: iter,
+      persona,
+      temperature,
+      lambda,
+      belief,
+      choice: action,
+      note: `payoff=${payoff}`,
+      rawText,
+      extra: {
+        strat,
+        opp,
+        payoff,
+        beliefCorrect: (belief >= 0.5 ? "C" : "D") === opp,
+        brMatch: bestResponsePDAction() === action,
+      },
+    };
+  }
+
+  async function runCondition(exp: Experiment, cond: string) {
+    const already = completedFor(exp.id, cond);
+    const startIter = startIterationFor(exp.id, cond);
+
+    if (already >= reps) {
+      addLog(`[SKIP] ${cond} already complete (${already}/${reps})`);
+      return;
+    }
+
+    if (startIter > 1) {
+      addLog(`[RESUME] ${cond} continuing from iter ${startIter}/${reps}`);
+    }
+
+    for (let i = startIter; i <= reps; i++) {
+      if (stopRef.current) break;
+      await waitIfPaused();
+      if (stopRef.current) break;
+
+      const persona = personaFor(i);
+      const temperature = tempFor(i);
+
+      setCurrentExp(exp.id);
+      setCurrentCond(cond);
+      setCurrentIter(i);
+      setStatus(`${exp.label} — ${cond}`);
+      addLog(`${exp.id} | ${cond} | iter ${i}/${reps}`);
+
+      try {
+        const row =
+          exp.id === "pd"
+            ? await runPDObservation(cond, i, persona, temperature)
+            : await runObservation(exp.id, cond, i, persona, temperature);
+
+        appendRawRow(row);
+        await sleep(80);
+      } catch (err) {
+        if (stopRef.current) break;
+        addLog(`ERROR: ${err instanceof Error ? err.message : String(err)}`);
+        addLog(`⏳ RETRYING SAME ITERATION ${i}...`);
+        i--;
+        await sleep(5000);
+        continue;
+      }
+    }
+
+    const done = completedFor(exp.id, cond);
+    if (done >= reps) {
+      addLog(`✅ ${cond} COMPLETE (${done}/${reps})`);
+    } else {
+      addLog(`⏸ ${cond} paused at ${done}/${reps}`);
+    }
+  }
+
+  async function runExperiment(exp: Experiment) {
+    if (stopRef.current) return;
+    setCurrentExp(exp.id);
+
+    for (const cond of exp.conditions) {
+      if (stopRef.current) break;
+      setCurrentCond(cond);
+      await runCondition(exp, cond);
+    }
+  }
+
+  async function runAll() {
+    if (running) return;
+    stopRef.current = false;
+    pauseRef.current = false;
+    setPaused(false);
+    setStatus("Running remaining experiments...");
+    setRunningState(true);
+
+    try {
+      setProgress((p) => ({ ...p, done: rawRowsRef.current.length, total: totalTarget }));
+      for (const exp of EXPERIMENTS) {
+        if (stopRef.current) break;
+        await runExperiment(exp);
+      }
+      setStatus(stopRef.current ? "Stopped." : "Complete.");
+    } catch (err) {
+      setStatus(`Error: ${err instanceof Error ? err.message : String(err)}`);
+      addLog(`ERROR: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setCurrentExp("");
+      setCurrentCond("");
+      setCurrentIter(0);
+      setRunningState(false);
+    }
+  }
+
+  async function runOneExperiment(expId: ExperimentId) {
+    if (running) return;
+    const exp = EXPERIMENTS.find((e) => e.id === expId);
+    if (!exp) return;
+
+    stopRef.current = false;
+    pauseRef.current = false;
+    setPaused(false);
+    setStatus(`Running ${exp.label}...`);
+    setRunningState(true);
+
+    try {
+      await runExperiment(exp);
+      setStatus(stopRef.current ? "Stopped." : `${exp.label} complete.`);
+    } catch (err) {
+      setStatus(`Error: ${err instanceof Error ? err.message : String(err)}`);
+      addLog(`ERROR: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setCurrentExp("");
+      setCurrentCond("");
+      setCurrentIter(0);
+      setRunningState(false);
+    }
+  }
+
+  function pause() {
+    if (!running) return;
+    pauseRef.current = true;
+    setPaused(true);
+    setStatus("Paused.");
+    addLog("⏸ paused");
+  }
+
+  function resume() {
+    if (!running) return;
+    pauseRef.current = false;
+    setPaused(false);
+    setStatus("Resumed.");
+    addLog("▶ resumed");
+  }
+
+  function stop() {
+    stopRef.current = true;
+    pauseRef.current = false;
+    setPaused(false);
+    setStatus("Stopping...");
+    addLog("⏹ stop requested");
+  }
+
+  function downloadJSON(filename: string, obj: unknown) {
+    const blob = new Blob([JSON.stringify(obj, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function downloadAll() {
+    downloadJSON("artificial-rationality-remaining.json", {
+      meta: {
+        kappa,
+        lambda0,
+        lambda,
+        reps,
+        generatedAt: new Date().toISOString(),
+      },
+      rawRows: normalizeRows(rawRows),
+      summaryRows,
+      log,
+    });
+  }
+
+  const latestRows = rawRows.slice(-120);
+  const totalDone = rawRows.length;
+
+  return (
+    <div style={{ minHeight: "100vh", background: "#0b1020", color: "#e5e7eb", fontFamily: "monospace", padding: 18 }}>
+      <div style={{ borderBottom: "1px solid #243046", paddingBottom: 12, marginBottom: 16 }}>
+        <div style={{ fontSize: 22, fontWeight: 700 }}>Artificial Rationality v7 — Behavioral Elicitation Suite</div>
+        <div style={{ marginTop: 6, color: "#94a3b8", fontSize: 13 }}>
+          Remaining experiments only. Resume-capable. Raw rows separate from summaries. λ = λ₀ × κ = {lambda.toFixed(3)}
+        </div>
+
+        <div style={{ display: "flex", gap: 12, marginTop: 14, flexWrap: "wrap", alignItems: "center" }}>
+          <label>
+            κ{" "}
+            <input
+              type="number"
+              value={kappa}
+              step="0.1"
+              min="0.1"
+              onChange={(e) => setKappa(Number(e.target.value))}
+              style={{ width: 80, marginLeft: 6 }}
+            />
+          </label>
+
+          <label>
+            λ₀{" "}
+            <input
+              type="number"
+              value={lambda0}
+              step="0.1"
+              min="0.1"
+              onChange={(e) => setLambda0(Number(e.target.value))}
+              style={{ width: 80, marginLeft: 6 }}
+            />
+          </label>
+
+          <label>
+            reps/condition{" "}
+            <input
+              type="number"
+              value={reps}
+              step="10"
+              min="10"
+              onChange={(e) => setReps(Math.max(10, Number(e.target.value) || 60))}
+              style={{ width: 90, marginLeft: 6 }}
+            />
+          </label>
+
+          <span style={{ color: "#fbbf24" }}>Current λ = {lambda.toFixed(3)}</span>
+          <span style={{ color: "#86efac" }}>{status}</span>
+          <span style={{ color: "#93c5fd" }}>
+            {totalDone}/{totalTarget} ({pct(totalDone, totalTarget)}%)
+          </span>
+          {currentExp && (
+            <span style={{ color: "#c084fc" }}>
+              {currentExp} {currentCond ? `— ${currentCond}` : ""} {currentIter ? `— iter ${currentIter}` : ""}
+            </span>
+          )}
+        </div>
+
+        <div style={{ display: "flex", gap: 10, marginTop: 14, flexWrap: "wrap" }}>
+          <button onClick={runAll} disabled={running} style={btnStyle}>Run / Resume All</button>
+          <button onClick={pause} disabled={!running || paused} style={btnStyle}>Pause</button>
+          <button onClick={resume} disabled={!running || !paused} style={btnStyle}>Resume</button>
+          <button onClick={stop} disabled={!running} style={btnStyle}>Stop</button>
+          <button onClick={downloadAll} disabled={!rawRows.length} style={btnStyle}>Download All</button>
+        </div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 12 }}>
+        {EXPERIMENTS.map((e) => {
+          const done = e.conditions.reduce((sum, cond) => sum + completedFor(e.id, cond), 0);
+          const total = e.conditions.length * reps;
+
+          return (
+            <button
+              key={e.id}
+              disabled={running}
+              onClick={() => runOneExperiment(e.id)}
+              style={{
+                padding: 14,
+                borderRadius: 12,
+                border: "1px solid #243046",
+                background: "#111a33",
+                color: "white",
+                cursor: running ? "not-allowed" : "pointer",
+                textAlign: "left",
+                opacity: running ? 0.6 : 1,
+              }}
+            >
+              <div style={{ fontWeight: 700 }}>{e.label}</div>
+              <div style={{ color: "#94a3b8", marginTop: 6, fontSize: 12 }}>
+                {done}/{total} done
+              </div>
+            </button>
+          );
+        })}
+      </div>
+
+      <div style={{ marginTop: 18, display: "grid", gridTemplateColumns: "1fr 0.9fr", gap: 14 }}>
+        <div style={{ background: "#0f172a", border: "1px solid #243046", borderRadius: 12, padding: 12 }}>
+          <div style={{ fontWeight: 700, marginBottom: 10 }}>Summary rows</div>
+          {summaryRows.length === 0 ? (
+            <div style={{ color: "#94a3b8" }}>No summaries yet.</div>
+          ) : (
+            <div style={{ display: "grid", gap: 10 }}>
+              {summaryRows.map((s) => (
+                <div key={`${s.experimentId}-${s.condition}`} style={{ border: "1px solid #1f2a3d", borderRadius: 10, padding: 10 }}>
+                  <div style={{ fontWeight: 700, marginBottom: 6 }}>{s.experimentLabel}</div>
+                  <div style={{ color: "#94a3b8", fontSize: 12, marginBottom: 6 }}>{s.condition} | n={s.n}</div>
+                  <pre style={{ whiteSpace: "pre-wrap", margin: 0, color: "#fbbf24", fontSize: 12 }}>
+                    {JSON.stringify(s.metrics, null, 2)}
+                  </pre>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div style={{ background: "#0f172a", border: "1px solid #243046", borderRadius: 12, padding: 12 }}>
+          <div style={{ fontWeight: 700, marginBottom: 10 }}>Log</div>
+          <div style={{ height: 430, overflow: "auto", fontSize: 12, lineHeight: 1.5, color: "#cbd5e1" }}>
+            {log.length === 0 ? (
+              <div style={{ color: "#94a3b8" }}>No log yet.</div>
+            ) : (
+              log.map((l, i) => <div key={i}>{l}</div>)
+            )}
+          </div>
+        </div>
+      </div>
+
+      <div style={{ marginTop: 18, background: "#0f172a", border: "1px solid #243046", borderRadius: 12, padding: 12 }}>
+        <div style={{ fontWeight: 700, marginBottom: 10 }}>Latest raw rows (last 120 only)</div>
+        {latestRows.length === 0 ? (
+          <div style={{ color: "#94a3b8" }}>No raw rows yet.</div>
+        ) : (
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+            <thead>
+              <tr style={{ color: "#94a3b8", textAlign: "left" }}>
+                <th style={th}>Exp</th>
+                <th style={th}>Condition</th>
+                <th style={th}>Iter</th>
+                <th style={th}>Belief</th>
+                <th style={th}>Choice</th>
+                <th style={th}>Note</th>
+              </tr>
+            </thead>
+            <tbody>
+              {latestRows.map((r) => (
+                <tr key={r.runId} style={{ borderTop: "1px solid #1f2a3d" }}>
+                  <td style={td}>{r.experimentLabel}</td>
+                  <td style={td}>{r.condition}</td>
+                  <td style={td}>{r.iteration}</td>
+                  <td style={td}>{r.belief == null ? "—" : r.belief.toFixed(3)}</td>
+                  <td style={td}>{r.choice ?? "—"}</td>
+                  <td style={{ ...td, color: "#fbbf24" }}>{r.note}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      <div style={{ marginTop: 14, color: "#94a3b8", fontSize: 12 }}>
+        This file resumes from saved rows and continues only the remaining experiments.
+      </div>
+    </div>
+  );
+}
+
+const btnStyle: React.CSSProperties = {
+  padding: "8px 12px",
+  borderRadius: 8,
+  border: "1px solid #334155",
+  background: "#1f2937",
+  color: "white",
+  cursor: "pointer",
+};
+
+const th: React.CSSProperties = { padding: "6px 4px" };
+const td: React.CSSProperties = { padding: "6px 4px" };
+
+
